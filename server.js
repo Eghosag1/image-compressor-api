@@ -30,13 +30,25 @@ function generateBatchId() {
 }
 
 const compressImage = async (file) => {
-  return await sharp(file.buffer)
+  const firstBuffer = await sharp(file.buffer)
     .resize({ width: 1800, withoutEnlargement: true })
-    .avif({
-      quality: 40,
-      effort: 4,
-    })
+    .webp({ quality: 75 })
     .toBuffer();
+
+  if (firstBuffer.length <= 200 * 1024) {
+    return firstBuffer;
+  }
+
+  const secondBuffer = await sharp(file.buffer)
+    .resize({ width: 1800, withoutEnlargement: true })
+    .webp({ quality: 65 })
+    .toBuffer();
+
+  if (secondBuffer.length <= 200 * 1024) {
+    return secondBuffer;
+  }
+
+  return firstBuffer.length <= secondBuffer.length ? firstBuffer : secondBuffer;
 };
 
 app.use(cors());
@@ -95,7 +107,7 @@ app.post("/compress", upload.array("images", 50), async (req, res, next) => {
     );
 
     for (const result of results) {
-      const filename = `${slug}-${batchId}-${result.index + 1}.avif`;
+      const filename = `${slug}-${batchId}-${result.index + 1}.webp`;
 
       archive.append(result.buffer, { name: filename });
     }
