@@ -10,6 +10,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const ALLOWED_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const limit = pLimit(2);
+const jobs = new Map();
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -29,27 +30,84 @@ function generateBatchId() {
   return crypto.randomBytes(3).toString("base64url").slice(0, 4).toLowerCase();
 }
 
-const compressImage = async (file) => {
-  const firstBuffer = await sharp(file.buffer)
-    .resize({ width: 1800, withoutEnlargement: true })
-    .webp({ quality: 75 })
-    .toBuffer();
+function generateJobId() {
+  return crypto.randomBytes(6).toString("base64url").toLowerCase();
+}
 
-  if (firstBuffer.length <= 200 * 1024) {
-    return firstBuffer;
+async function compressImage(fileBuffer) {
+  return sharp(fileBuffer)
+    .resize({ width: 1800, withoutEnlargement: true })
+    .avif({
+      quality: 40,
+      effort: 1,
+    })
+    .toBuffer();
+}
+
+async function createZipBuffer(files, slug, batchId) {
+  const archive = archiver("zip", { zlib: { level: 9 } });
+  const chunks = [];
+
+  return new Promise((resolve, reject) => {
+    archive.on("data", (chunk) => {
+      chunks.push(chunk);
+    });
+
+    archive.on("warning", (error) => {
+      reject(error);
+    });
+
+    archive.on("error", (error) => {
+      reject(error);
+    });
+
+    archive.on("end", () => {
+      resolve(Buffer.concat(chunks));
+    });
+
+    for (const [index, file] of files.entries()) {
+      archive.append(file.buffer, {
+        name: `${slug}-${batchId}-${index + 1}.avif`,
+      });
+    }
+
+    archive.finalize().catch(reject);
+  });
+}
+
+async function processJob(jobId, files, seoName) {
+  const job = jobs.get(jobId);
+
+  if (!job) {
+    return;
   }
 
-  const secondBuffer = await sharp(file.buffer)
-    .resize({ width: 1800, withoutEnlargement: true })
-    .webp({ quality: 65 })
-    .toBuffer();
+  try {
+    const slug = slugifySeoName(seoName) || "image";
+    const compressedFiles = await Promise.all(
+      files.map((file) =>
+        limit(async () => {
+          const buffer = await compressImage(file.buffer);
 
-  if (secondBuffer.length <= 200 * 1024) {
-    return secondBuffer;
+          job.progress.completed += 1;
+
+          return { buffer };
+        })
+      )
+    );
+
+    const zipBuffer = await createZipBuffer(compressedFiles, slug, job.batchId);
+
+    job.zipBuffer = zipBuffer;
+    job.zipFilename = `${slug}-${job.batchId}-compressed.zip`;
+    job.status = "done";
+    job.completedFiles = job.progress.completed;
+    job.totalFiles = job.progress.total;
+  } catch (error) {
+    job.status = "failed";
+    job.error = error.message || "Job processing failed";
   }
-
-  return firstBuffer.length <= secondBuffer.length ? firstBuffer : secondBuffer;
-};
+}
 
 app.use(cors());
 
@@ -76,46 +134,76 @@ app.post("/compress", upload.array("images", 50), async (req, res, next) => {
       return res.status(400).json({ error: "Only JPEG, PNG, and WEBP files are allowed" });
     }
 
-    const slug = slugifySeoName(seoName) || "image";
+    const jobId = generateJobId();
     const batchId = generateBatchId();
+    const job = {
+      jobId,
+      status: "processing",
+      seoName,
+      batchId,
+      createdAt: new Date().toISOString(),
+      progress: {
+        completed: 0,
+        total: files.length,
+      },
+      totalFiles: files.length,
+      completedFiles: 0,
+      zipBuffer: null,
+      zipFilename: null,
+      error: null,
+    };
 
-    res.setHeader("Content-Type", "application/zip");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${slug}-${batchId}-compressed.zip"`
-    );
+    jobs.set(jobId, job);
 
-    const archive = archiver("zip", { zlib: { level: 9 } });
-
-    archive.on("error", (error) => {
-      next(error);
+    res.json({
+      jobId,
+      status: "processing",
     });
 
-    archive.pipe(res);
-
-    const results = await Promise.all(
-      files.map((file, index) =>
-        limit(async () => {
-          const buffer = await compressImage(file);
-
-          return {
-            buffer,
-            index,
-          };
-        })
-      )
-    );
-
-    for (const result of results) {
-      const filename = `${slug}-${batchId}-${result.index + 1}.webp`;
-
-      archive.append(result.buffer, { name: filename });
-    }
-
-    await archive.finalize();
+    setImmediate(() => {
+      processJob(jobId, files, seoName);
+    });
   } catch (error) {
     next(error);
   }
+});
+
+app.get("/status/:jobId", (req, res) => {
+  const job = jobs.get(req.params.jobId);
+
+  if (!job) {
+    return res.status(404).json({ error: "Job not found" });
+  }
+
+  res.json({
+    jobId: job.jobId,
+    status: job.status,
+    progress: {
+      completed: job.progress.completed,
+      total: job.progress.total,
+    },
+    downloadUrl: job.status === "done" ? `/download/${job.jobId}` : null,
+    error: job.error,
+  });
+});
+
+app.get("/download/:jobId", (req, res) => {
+  const job = jobs.get(req.params.jobId);
+
+  if (!job) {
+    return res.status(404).json({ error: "Job not found" });
+  }
+
+  if (job.status !== "done" || !job.zipBuffer || !job.zipFilename) {
+    return res.status(409).json({ error: "Job is not ready for download" });
+  }
+
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="${job.zipFilename}"`
+  );
+  res.send(job.zipBuffer);
 });
 
 app.use((error, req, res, next) => {
