@@ -25,20 +25,15 @@ POST /compress
   - image/webp
 
 ## Processing
-- convert all output images to AVIF
+- convert all images to AVIF
 - resize images to max width 1800px
 - do not enlarge smaller images
-- process images in memory
-- do not save files to disk
-- use a fast hybrid compression strategy instead of a full iterative loop
-- try these AVIF quality levels in order:
-  - 45
-  - 35
-  - 30
-- after resizing to max width 1800px, test each quality level
-- if one version is <= 200 KB, use the first one that meets the target
-- if none of them are <= 200 KB, use the smallest version produced
-- prioritize a strong balance between speed and practical file size reduction
+- process images fully in memory
+- use single-pass AVIF compression
+- use AVIF quality 40
+- process multiple images in parallel with a controlled concurrency limit
+- limit parallel processing to avoid memory overload
+- prioritize speed, stability, and predictable performance
 
 ## Filename rules
 - do not use the original uploaded filename as the base

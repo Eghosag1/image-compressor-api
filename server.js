@@ -4,10 +4,12 @@ const multer = require("multer");
 const sharp = require("sharp");
 const archiver = require("archiver");
 const crypto = require("crypto");
+const pLimit = require("p-limit");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const ALLOWED_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const limit = pLimit(2);
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -27,32 +29,12 @@ function generateBatchId() {
   return crypto.randomBytes(3).toString("base64url").slice(0, 4).toLowerCase();
 }
 
-async function compressToTargetAvif(buffer) {
-  const qualities = [45, 35, 30];
-  let smallestBuffer = null;
-
-  for (const quality of qualities) {
-    const outputBuffer = await sharp(buffer)
-      .rotate()
-      .resize({
-        width: 1800,
-        withoutEnlargement: true,
-        fit: "inside",
-      })
-      .avif({ quality })
-      .toBuffer();
-
-    if (!smallestBuffer || outputBuffer.length < smallestBuffer.length) {
-      smallestBuffer = outputBuffer;
-    }
-
-    if (outputBuffer.length <= 200 * 1024) {
-      return outputBuffer;
-    }
-  }
-
-  return smallestBuffer;
-}
+const compressImage = async (file) => {
+  return await sharp(file.buffer)
+    .resize({ width: 1800, withoutEnlargement: true })
+    .avif({ quality: 40 })
+    .toBuffer();
+};
 
 app.use(cors());
 
@@ -96,11 +78,23 @@ app.post("/compress", upload.array("images", 50), async (req, res, next) => {
 
     archive.pipe(res);
 
-    for (const [index, file] of files.entries()) {
-      const compressedBuffer = await compressToTargetAvif(file.buffer);
-      const filename = `${slug}-${batchId}-${index + 1}.avif`;
+    const results = await Promise.all(
+      files.map((file, index) =>
+        limit(async () => {
+          const buffer = await compressImage(file);
 
-      archive.append(compressedBuffer, { name: filename });
+          return {
+            buffer,
+            index,
+          };
+        })
+      )
+    );
+
+    for (const result of results) {
+      const filename = `${slug}-${batchId}-${result.index + 1}.avif`;
+
+      archive.append(result.buffer, { name: filename });
     }
 
     await archive.finalize();
