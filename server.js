@@ -14,7 +14,7 @@ const TMP_DIR = path.join(__dirname, "tmp");
 const UPLOADS_DIR = path.join(TMP_DIR, "uploads");
 const PROCESSED_DIR = path.join(TMP_DIR, "processed");
 const ZIPS_DIR = path.join(TMP_DIR, "zips");
-const JOB_TTL_MS = 1000 * 60 * 60;
+const JOB_TTL = 60 * 60 * 1000;
 const jobs = new Map();
 
 sharp.concurrency(1);
@@ -73,40 +73,53 @@ async function createZipFromFiles(filePaths, zipPath) {
   });
 }
 
-async function safeUnlink(filePath) {
-  if (!filePath) {
-    return;
-  }
-
+function safeUnlink(filePath) {
   try {
-    await fs.promises.unlink(filePath);
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      throw error;
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
     }
+  } catch (error) {
+    console.error("Cleanup error:", error);
   }
 }
 
-async function cleanupOldJobs() {
+function cleanupFolder(folderPath) {
+  try {
+    const files = fs.readdirSync(folderPath);
+
+    files.forEach((file) => {
+      const filePath = path.join(folderPath, file);
+
+      try {
+        const stats = fs.statSync(filePath);
+
+        if (Date.now() - stats.mtimeMs > JOB_TTL) {
+          fs.unlinkSync(filePath);
+        }
+      } catch (error) {
+        console.error("Folder cleanup error:", error);
+      }
+    });
+  } catch (error) {
+    console.error("Folder cleanup error:", error);
+  }
+}
+
+function cleanupOldJobs() {
   const now = Date.now();
 
   for (const [jobId, job] of jobs.entries()) {
-    const createdAt = new Date(job.createdAt).getTime();
-
-    if (Number.isNaN(createdAt) || now - createdAt < JOB_TTL_MS) {
-      continue;
-    }
-
-    if (job.zipPath) {
-      try {
-        await safeUnlink(job.zipPath);
-      } catch (error) {
-        console.error("Failed to clean zip file:", error);
+    if (now - job.createdAt > JOB_TTL) {
+      if (job.zipPath) {
+        safeUnlink(job.zipPath);
       }
-    }
 
-    jobs.delete(jobId);
+      jobs.delete(jobId);
+    }
   }
+
+  cleanupFolder(UPLOADS_DIR);
+  cleanupFolder(PROCESSED_DIR);
 }
 
 ensureDirectories();
@@ -151,7 +164,7 @@ async function processJob(jobId, files, seoName) {
       job.progress.completed += 1;
       job.completedFiles = job.progress.completed;
 
-      await safeUnlink(file.path);
+      safeUnlink(file.path);
     }
 
     const zipFilename = `${slug}-${job.batchId}-compressed.zip`;
@@ -160,7 +173,7 @@ async function processJob(jobId, files, seoName) {
     await createZipFromFiles(processedPaths, zipPath);
 
     for (const processedPath of processedPaths) {
-      await safeUnlink(processedPath);
+      safeUnlink(processedPath);
     }
 
     job.zipPath = zipPath;
@@ -172,7 +185,7 @@ async function processJob(jobId, files, seoName) {
 
     for (const filePath of [...originalPaths, ...processedPaths]) {
       try {
-        await safeUnlink(filePath);
+        safeUnlink(filePath);
       } catch (unlinkError) {
         console.error("Failed to remove temp file:", unlinkError);
       }
@@ -180,11 +193,7 @@ async function processJob(jobId, files, seoName) {
   }
 }
 
-setInterval(() => {
-  cleanupOldJobs().catch((error) => {
-    console.error("Cleanup failed:", error);
-  });
-}, 1000 * 60 * 15);
+setInterval(cleanupOldJobs, 10 * 60 * 1000);
 
 app.use(cors());
 
@@ -199,7 +208,7 @@ app.post("/compress", upload.array("images", 50), async (req, res, next) => {
 
     if (!seoName || !String(seoName).trim()) {
       for (const file of files) {
-        await safeUnlink(file.path);
+        safeUnlink(file.path);
       }
 
       return res.status(400).json({ error: "seoName is required" });
@@ -213,7 +222,7 @@ app.post("/compress", upload.array("images", 50), async (req, res, next) => {
 
     if (invalidFile) {
       for (const file of files) {
-        await safeUnlink(file.path);
+        safeUnlink(file.path);
       }
 
       return res.status(400).json({ error: "Only JPEG, PNG, and WEBP files are allowed" });
@@ -227,7 +236,7 @@ app.post("/compress", upload.array("images", 50), async (req, res, next) => {
       status: "processing",
       seoName,
       batchId,
-      createdAt: new Date().toISOString(),
+      createdAt: Date.now(),
       progress: {
         completed: 0,
         total: files.length,
@@ -279,7 +288,8 @@ app.get("/status/:jobId", (req, res) => {
 });
 
 app.get("/download/:jobId", (req, res) => {
-  const job = jobs.get(req.params.jobId);
+  const jobId = req.params.jobId;
+  const job = jobs.get(jobId);
 
   if (!job) {
     return res.status(404).json({ error: "Job not found" });
@@ -289,7 +299,16 @@ app.get("/download/:jobId", (req, res) => {
     return res.status(409).json({ error: "Job is not ready for download" });
   }
 
-  res.download(job.zipPath, job.zipFilename);
+  res.download(job.zipPath, job.zipFilename, (error) => {
+    if (error) {
+      return;
+    }
+
+    setTimeout(() => {
+      safeUnlink(job.zipPath);
+      jobs.delete(jobId);
+    }, 60 * 1000);
+  });
 });
 
 app.use((error, req, res, next) => {
