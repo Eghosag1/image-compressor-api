@@ -4,7 +4,7 @@ const multer = require("multer");
 const sharp = require("sharp");
 const archiver = require("archiver");
 const crypto = require("crypto");
-const pLimit = require("p-limit");
+const pLimit = require("p-limit").default;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
