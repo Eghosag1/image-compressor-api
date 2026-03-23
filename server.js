@@ -32,7 +32,10 @@ function generateBatchId() {
 const compressImage = async (file) => {
   return await sharp(file.buffer)
     .resize({ width: 1800, withoutEnlargement: true })
-    .avif({ quality: 40 })
+    .avif({
+      quality: 40,
+      effort: 4,
+    })
     .toBuffer();
 };
 
