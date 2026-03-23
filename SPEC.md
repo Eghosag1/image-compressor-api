@@ -1,29 +1,29 @@
 # Image Compressor API - SPEC
 
 ## Goal
-Build a production-minded Node.js image compression API for a Webflow frontend using background processing.
+Build a production-minded Node.js image compression API for a Webflow frontend using background processing and disk-based temporary storage.
 
 ## Stack
 - Node.js
 - Express
-- Multer with memory storage
+- Multer with disk storage
 - Sharp
 - CORS
 - Archiver
-- p-limit
 
 ## Output format
-- use AVIF again
+- use AVIF
 - resize images to max width 1800px
 - do not enlarge smaller images
 
 ## Compression strategy
 - use AVIF
-- use single-pass compression for speed and stability
+- single-pass compression
 - use:
   - quality: 40
   - effort: 1
-- process images fully in memory
+- process one image at a time
+- prioritize stability and lower memory usage
 
 ## Input
 - multipart/form-data
@@ -38,24 +38,21 @@ Build a production-minded Node.js image compression API for a Webflow frontend u
 ## Filename rules
 - do not use original uploaded filenames as base
 - use req.body.seoName as the filename base
-- sanitize seoName into an SEO-friendly slug:
-  - lowercase only
-  - remove accents
-  - remove special characters
-  - replace spaces and separators with hyphens
-  - remove duplicate hyphens
-  - trim leading and trailing hyphens
+- sanitize seoName into an SEO-friendly slug
 - generate one short random batch id per job
-- use the same batch id for all files in the job
 - filename format inside zip:
   [slug]-[batchId]-[index].avif
 - zip filename:
   [slug]-[batchId]-compressed.zip
 
 ## Processing model
-- compression must run in the background
-- POST /compress must NOT wait for the zip to finish
-- POST /compress must create a job and return JSON immediately
+- compression runs in the background
+- POST /compress creates a job and returns immediately
+- uploaded originals are stored temporarily on disk
+- compressed files are written temporarily to disk
+- final zip file is written to disk
+- completed jobs keep only metadata and file paths in memory
+- no zip buffers in RAM
 - jobs are stored in memory
 - each job must have:
   - jobId
@@ -66,13 +63,9 @@ Build a production-minded Node.js image compression API for a Webflow frontend u
   - progress
   - totalFiles
   - completedFiles
-  - zipBuffer when done
+  - zipPath when done
   - zipFilename when done
   - error when failed
-
-## Concurrency
-- use controlled parallel processing
-- use p-limit with concurrency 2
 
 ## Endpoints
 
@@ -105,9 +98,16 @@ Build a production-minded Node.js image compression API for a Webflow frontend u
 
 ### GET /download/:jobId
 - if job is done:
-  - returns the zip file directly
+  - returns the zip file directly from disk
 - if job is not done:
-  - returns JSON error with proper status code
+  - returns JSON error
+
+## Cleanup
+- create temporary directories if they do not exist
+- remove original uploaded files after compression
+- remove temporary compressed files after zip creation
+- optionally keep the final zip for download
+- include a simple cleanup strategy for old jobs/files
 
 ## Extra
 - include proper error handling

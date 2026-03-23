@@ -4,17 +4,21 @@ const multer = require("multer");
 const sharp = require("sharp");
 const archiver = require("archiver");
 const crypto = require("crypto");
-const pLimit = require("p-limit").default;
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const ALLOWED_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
-const limit = pLimit(2);
+const TMP_DIR = path.join(__dirname, "tmp");
+const UPLOADS_DIR = path.join(TMP_DIR, "uploads");
+const PROCESSED_DIR = path.join(TMP_DIR, "processed");
+const ZIPS_DIR = path.join(TMP_DIR, "zips");
+const JOB_TTL_MS = 1000 * 60 * 60;
 const jobs = new Map();
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-});
+sharp.concurrency(1);
+sharp.cache(false);
 
 function slugifySeoName(seoName) {
   return String(seoName || "")
@@ -34,46 +38,94 @@ function generateJobId() {
   return crypto.randomBytes(6).toString("base64url").toLowerCase();
 }
 
-async function compressImage(fileBuffer) {
-  return sharp(fileBuffer)
+function ensureDirectories() {
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+  fs.mkdirSync(PROCESSED_DIR, { recursive: true });
+  fs.mkdirSync(ZIPS_DIR, { recursive: true });
+}
+
+async function compressImageToFile(inputPath, outputPath) {
+  await sharp(inputPath)
     .resize({ width: 1800, withoutEnlargement: true })
     .avif({
       quality: 40,
       effort: 1,
     })
-    .toBuffer();
+    .toFile(outputPath);
 }
 
-async function createZipBuffer(files, slug, batchId) {
-  const archive = archiver("zip", { zlib: { level: 9 } });
-  const chunks = [];
-
+async function createZipFromFiles(filePaths, zipPath) {
   return new Promise((resolve, reject) => {
-    archive.on("data", (chunk) => {
-      chunks.push(chunk);
-    });
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver("zip", { zlib: { level: 9 } });
 
-    archive.on("warning", (error) => {
-      reject(error);
-    });
+    output.on("close", resolve);
+    output.on("error", reject);
+    archive.on("error", reject);
 
-    archive.on("error", (error) => {
-      reject(error);
-    });
+    archive.pipe(output);
 
-    archive.on("end", () => {
-      resolve(Buffer.concat(chunks));
-    });
-
-    for (const [index, file] of files.entries()) {
-      archive.append(file.buffer, {
-        name: `${slug}-${batchId}-${index + 1}.avif`,
-      });
+    for (const filePath of filePaths) {
+      archive.file(filePath, { name: path.basename(filePath) });
     }
 
     archive.finalize().catch(reject);
   });
 }
+
+async function safeUnlink(filePath) {
+  if (!filePath) {
+    return;
+  }
+
+  try {
+    await fs.promises.unlink(filePath);
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+  }
+}
+
+async function cleanupOldJobs() {
+  const now = Date.now();
+
+  for (const [jobId, job] of jobs.entries()) {
+    const createdAt = new Date(job.createdAt).getTime();
+
+    if (Number.isNaN(createdAt) || now - createdAt < JOB_TTL_MS) {
+      continue;
+    }
+
+    if (job.zipPath) {
+      try {
+        await safeUnlink(job.zipPath);
+      } catch (error) {
+        console.error("Failed to clean zip file:", error);
+      }
+    }
+
+    jobs.delete(jobId);
+  }
+}
+
+ensureDirectories();
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, UPLOADS_DIR);
+  },
+  filename: (req, file, cb) => {
+    const uniqueName = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}${path.extname(
+      file.originalname
+    )}`;
+    cb(null, uniqueName);
+  },
+});
+
+const upload = multer({
+  storage,
+});
 
 async function processJob(jobId, files, seoName) {
   const job = jobs.get(jobId);
@@ -82,32 +134,57 @@ async function processJob(jobId, files, seoName) {
     return;
   }
 
+  const slug = slugifySeoName(seoName) || "image";
+  const processedPaths = [];
+  const originalPaths = files.map((file) => file.path);
+
   try {
-    const slug = slugifySeoName(seoName) || "image";
-    const compressedFiles = await Promise.all(
-      files.map((file) =>
-        limit(async () => {
-          const buffer = await compressImage(file.buffer);
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      const outputPath = path.join(
+        PROCESSED_DIR,
+        `${slug}-${job.batchId}-${index + 1}.avif`
+      );
 
-          job.progress.completed += 1;
+      await compressImageToFile(file.path, outputPath);
+      processedPaths.push(outputPath);
+      job.progress.completed += 1;
+      job.completedFiles = job.progress.completed;
 
-          return { buffer };
-        })
-      )
-    );
+      await safeUnlink(file.path);
+    }
 
-    const zipBuffer = await createZipBuffer(compressedFiles, slug, job.batchId);
+    const zipFilename = `${slug}-${job.batchId}-compressed.zip`;
+    const zipPath = path.join(ZIPS_DIR, zipFilename);
 
-    job.zipBuffer = zipBuffer;
-    job.zipFilename = `${slug}-${job.batchId}-compressed.zip`;
+    await createZipFromFiles(processedPaths, zipPath);
+
+    for (const processedPath of processedPaths) {
+      await safeUnlink(processedPath);
+    }
+
+    job.zipPath = zipPath;
+    job.zipFilename = zipFilename;
     job.status = "done";
-    job.completedFiles = job.progress.completed;
-    job.totalFiles = job.progress.total;
   } catch (error) {
     job.status = "failed";
     job.error = error.message || "Job processing failed";
+
+    for (const filePath of [...originalPaths, ...processedPaths]) {
+      try {
+        await safeUnlink(filePath);
+      } catch (unlinkError) {
+        console.error("Failed to remove temp file:", unlinkError);
+      }
+    }
   }
 }
+
+setInterval(() => {
+  cleanupOldJobs().catch((error) => {
+    console.error("Cleanup failed:", error);
+  });
+}, 1000 * 60 * 15);
 
 app.use(cors());
 
@@ -121,6 +198,10 @@ app.post("/compress", upload.array("images", 50), async (req, res, next) => {
     const seoName = req.body.seoName;
 
     if (!seoName || !String(seoName).trim()) {
+      for (const file of files) {
+        await safeUnlink(file.path);
+      }
+
       return res.status(400).json({ error: "seoName is required" });
     }
 
@@ -131,12 +212,17 @@ app.post("/compress", upload.array("images", 50), async (req, res, next) => {
     const invalidFile = files.find((file) => !ALLOWED_MIME_TYPES.has(file.mimetype));
 
     if (invalidFile) {
+      for (const file of files) {
+        await safeUnlink(file.path);
+      }
+
       return res.status(400).json({ error: "Only JPEG, PNG, and WEBP files are allowed" });
     }
 
     const jobId = generateJobId();
     const batchId = generateBatchId();
-    const job = {
+
+    jobs.set(jobId, {
       jobId,
       status: "processing",
       seoName,
@@ -148,12 +234,10 @@ app.post("/compress", upload.array("images", 50), async (req, res, next) => {
       },
       totalFiles: files.length,
       completedFiles: 0,
-      zipBuffer: null,
+      zipPath: null,
       zipFilename: null,
       error: null,
-    };
-
-    jobs.set(jobId, job);
+    });
 
     res.json({
       jobId,
@@ -161,7 +245,14 @@ app.post("/compress", upload.array("images", 50), async (req, res, next) => {
     });
 
     setImmediate(() => {
-      processJob(jobId, files, seoName);
+      processJob(jobId, files, seoName).catch((error) => {
+        const job = jobs.get(jobId);
+
+        if (job) {
+          job.status = "failed";
+          job.error = error.message || "Job processing failed";
+        }
+      });
     });
   } catch (error) {
     next(error);
@@ -194,16 +285,11 @@ app.get("/download/:jobId", (req, res) => {
     return res.status(404).json({ error: "Job not found" });
   }
 
-  if (job.status !== "done" || !job.zipBuffer || !job.zipFilename) {
+  if (job.status !== "done" || !job.zipPath || !job.zipFilename) {
     return res.status(409).json({ error: "Job is not ready for download" });
   }
 
-  res.setHeader("Content-Type", "application/zip");
-  res.setHeader(
-    "Content-Disposition",
-    `attachment; filename="${job.zipFilename}"`
-  );
-  res.send(job.zipBuffer);
+  res.download(job.zipPath, job.zipFilename);
 });
 
 app.use((error, req, res, next) => {
@@ -215,7 +301,7 @@ app.use((error, req, res, next) => {
     return next(error);
   }
 
-  res.status(500).json({ error: "Internal server error" });
+  res.status(500).json({ error: error.message || "Internal server error" });
 });
 
 app.listen(PORT, () => {
