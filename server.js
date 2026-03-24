@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
 const multer = require("multer");
 const sharp = require("sharp");
 const archiver = require("archiver");
@@ -7,8 +8,11 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const pLimit = require("p-limit");
+const rateLimit = require("express-rate-limit");
 
 const app = express();
+app.set("trust proxy", 1);
+app.use(helmet());
 const allowedOrigins = [
   "https://bauwens-vastgoed.webflow.io",
   "https://bauwensvastgoed.be",
@@ -30,6 +34,10 @@ const ZIPS_DIR = path.join(TMP_DIR, "zips");
 const JOB_TTL = 60 * 60 * 1000;
 const jobs = new Map();
 const limit = pLimit(2);
+const compressRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 50,
+});
 
 sharp.concurrency(2);
 sharp.cache(false);
@@ -202,6 +210,7 @@ async function processJob(jobId, files, seoName) {
     job.zipFilename = zipFilename;
     job.status = "done";
   } catch (error) {
+    console.error("Job error:", error);
     job.status = "failed";
     job.error = error.message || "Job processing failed";
 
@@ -223,7 +232,7 @@ app.get("/", (req, res) => {
   res.send("API werkt");
 });
 
-app.post("/compress", upload.array("images", 50), async (req, res, next) => {
+app.post("/compress", compressRateLimit, upload.array("images", 50), async (req, res, next) => {
   try {
     const files = req.files || [];
     const seoName = req.body.seoName;
@@ -253,6 +262,8 @@ app.post("/compress", upload.array("images", 50), async (req, res, next) => {
     const jobId = generateJobId();
     const batchId = generateBatchId();
 
+    console.log("New job from IP:", req.ip, "files:", files.length);
+
     jobs.set(jobId, {
       jobId,
       status: "processing",
@@ -277,6 +288,7 @@ app.post("/compress", upload.array("images", 50), async (req, res, next) => {
 
     setImmediate(() => {
       processJob(jobId, files, seoName).catch((error) => {
+        console.error("Job error:", error);
         const job = jobs.get(jobId);
 
         if (job) {
@@ -320,6 +332,8 @@ app.get("/download/:jobId", (req, res) => {
   if (job.status !== "done" || !job.zipPath || !job.zipFilename) {
     return res.status(409).json({ error: "Job is not ready for download" });
   }
+
+  console.log("Download by IP:", req.ip, "job:", jobId);
 
   res.download(job.zipPath, job.zipFilename, (error) => {
     if (error) {
