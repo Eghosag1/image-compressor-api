@@ -6,6 +6,7 @@ const archiver = require("archiver");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const pLimit = require("p-limit");
 
 const app = express();
 const allowedOrigins = [
@@ -28,8 +29,9 @@ const PROCESSED_DIR = path.join(TMP_DIR, "processed");
 const ZIPS_DIR = path.join(TMP_DIR, "zips");
 const JOB_TTL = 60 * 60 * 1000;
 const jobs = new Map();
+const limit = pLimit(2);
 
-sharp.concurrency(1);
+sharp.concurrency(2);
 sharp.cache(false);
 
 function slugifySeoName(seoName) {
@@ -69,7 +71,7 @@ async function compressImageToFile(inputPath, outputPath) {
 async function createZipFromFiles(filePaths, zipPath) {
   return new Promise((resolve, reject) => {
     const output = fs.createWriteStream(zipPath);
-    const archive = archiver("zip", { zlib: { level: 9 } });
+    const archive = archiver("zip", { zlib: { level: 1 } });
 
     output.on("close", resolve);
     output.on("error", reject);
@@ -160,23 +162,31 @@ async function processJob(jobId, files, seoName) {
   }
 
   const slug = slugifySeoName(seoName) || "image";
-  const processedPaths = [];
+  const processedPaths = new Array(files.length);
   const originalPaths = files.map((file) => file.path);
 
   try {
-    for (let index = 0; index < files.length; index += 1) {
-      const file = files[index];
-      const outputPath = path.join(
-        PROCESSED_DIR,
-        `${slug}-${job.batchId}-${index + 1}.avif`
-      );
+    const results = await Promise.allSettled(
+      files.map((file, index) =>
+        limit(async () => {
+          const outputPath = path.join(
+            PROCESSED_DIR,
+            `${slug}-${job.batchId}-${index + 1}.avif`
+          );
 
-      await compressImageToFile(file.path, outputPath);
-      processedPaths.push(outputPath);
-      job.progress.completed += 1;
-      job.completedFiles = job.progress.completed;
+          await compressImageToFile(file.path, outputPath);
+          processedPaths[index] = outputPath;
+          job.progress.completed += 1;
+          job.completedFiles = job.progress.completed;
+          safeUnlink(file.path);
+        })
+      )
+    );
 
-      safeUnlink(file.path);
+    const failedResult = results.find((result) => result.status === "rejected");
+
+    if (failedResult) {
+      throw failedResult.reason;
     }
 
     const zipFilename = `${slug}-${job.batchId}-compressed.zip`;
