@@ -284,8 +284,12 @@ app.get("/", (req, res) => {
 
 app.post("/compress", compressRateLimit, upload.array("images", 50), async (req, res, next) => {
   try {
+    const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+    const ua = req.headers["user-agent"];
     const files = req.files || [];
     const seoName = req.body.seoName;
+
+    console.log(`New job from IP: ${ip} | UA: ${ua} | files: ${files.length}`);
 
     if (!seoName || !String(seoName).trim()) {
       for (const file of files) {
@@ -311,8 +315,6 @@ app.post("/compress", compressRateLimit, upload.array("images", 50), async (req,
 
     const jobId = generateJobId();
     const batchId = generateBatchId();
-
-    console.log("New job from IP:", req.ip, "files:", files.length);
 
     jobs.set(jobId, {
       jobId,
