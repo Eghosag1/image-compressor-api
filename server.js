@@ -70,8 +70,8 @@ async function compressImageToFile(inputPath, outputPath) {
   await sharp(inputPath)
     .resize({ width: 1800, withoutEnlargement: true })
     .avif({
-      quality: 40,
-      effort: 1,
+      quality: 55,
+      effort: 3,
     })
     .toFile(outputPath);
 }
