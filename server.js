@@ -13,15 +13,12 @@ const allowedOrigins = [
   "https://bauwensvastgoed.be",
   "https://www.bauwensvastgoed.be",
 ];
-const corsOptions = {
-  origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
 
-    return callback(new Error("Not allowed by CORS"));
-  },
+const corsOptions = {
+  origin: allowedOrigins,
   methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type"],
+  optionsSuccessStatus: 204,
 };
 const PORT = process.env.PORT || 3000;
 const ALLOWED_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
@@ -211,7 +208,6 @@ async function processJob(jobId, files, seoName) {
 setInterval(cleanupOldJobs, 10 * 60 * 1000);
 
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
 
 app.get("/", (req, res) => {
   res.send("API werkt");
