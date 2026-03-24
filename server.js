@@ -66,14 +66,64 @@ function ensureDirectories() {
   fs.mkdirSync(ZIPS_DIR, { recursive: true });
 }
 
-async function compressImageToFile(inputPath, outputPath) {
+async function writeAvifVariant(inputPath, outputPath, width, quality) {
   await sharp(inputPath)
-    .resize({ width: 1800, withoutEnlargement: true })
+    .resize({ width, withoutEnlargement: true })
     .avif({
-      quality: 55,
+      quality,
       effort: 3,
     })
     .toFile(outputPath);
+
+  const stats = await fs.promises.stat(outputPath);
+
+  return stats.size;
+}
+
+async function compressImageToFile(inputPath, outputPath) {
+  const maxSizeBytes = 250 * 1024;
+  const candidates = [
+    { width: 1800, quality: 55 },
+    { width: 1800, quality: 48 },
+    { width: 1600, quality: 48 },
+  ];
+  const tempPaths = [];
+  let chosenPath = null;
+  let chosenSize = Infinity;
+
+  try {
+    for (let index = 0; index < candidates.length; index += 1) {
+      const candidate = candidates[index];
+      const tempPath = `${outputPath}.tmp-${index}`;
+      const size = await writeAvifVariant(
+        inputPath,
+        tempPath,
+        candidate.width,
+        candidate.quality
+      );
+
+      tempPaths.push(tempPath);
+
+      if (size < chosenSize) {
+        chosenPath = tempPath;
+        chosenSize = size;
+      }
+
+      if (size <= maxSizeBytes) {
+        chosenPath = tempPath;
+        chosenSize = size;
+        break;
+      }
+    }
+
+    await fs.promises.rename(chosenPath, outputPath);
+  } finally {
+    for (const tempPath of tempPaths) {
+      if (tempPath !== chosenPath) {
+        safeUnlink(tempPath);
+      }
+    }
+  }
 }
 
 async function createZipFromFiles(filePaths, zipPath) {
